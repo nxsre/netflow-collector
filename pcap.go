@@ -12,6 +12,8 @@ import (
 	"net"
 	"strconv"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -53,15 +55,32 @@ func GetCollector(ifname string) collector.Collector {
 		go capture(ifname, flowIn)
 	}
 	var col = &Collector{
-		metrics: map[string]prometheus.Metric{},
+		Metrics: map[string]ColMetric{},
 	}
+
+	go func() {
+		// 清理垃圾指标
+		ticker := time.NewTicker(5 * time.Second)
+		for {
+			select {
+			case <-ticker.C:
+				col.Lock()
+				for k, v := range col.Metrics {
+					if time.Now().Sub(v.timeStamp).Seconds() >= 5 {
+						delete(col.Metrics, k)
+					}
+				}
+				col.Unlock()
+			}
+		}
+	}()
+
 	go func() {
 		// 实时读出窗口中的数据
 		for e := range sink.Out {
 			ts := calcTraffic(e.([]interface{}))
 			for key, v := range ts {
 				// TODO: 经过统计的流量监控数据写入到 kafka
-				//log.Println(k, humanize.Bytes(v.Val))
 				desc := prometheus.NewDesc(v.Meta.Protocol.String(), "netflow-collector details metric",
 					[]string{"Protocol", "Version", "Direction", "LocalIP", "LocalPort", "PeerIP", "PeerPort"},
 					prometheus.Labels{"owner": "netflow-collector@odv"},
@@ -86,18 +105,13 @@ func GetCollector(ifname string) collector.Collector {
 						v.Meta.DstIP.String(),
 						strconv.FormatUint(uint64(v.Meta.DstPort), 10)}
 				}
-
-				metric, err := prometheus.NewConstMetric(desc, prometheus.GaugeValue, float64(v.Val), labels...)
+				metric, err := prometheus.NewConstMetric(desc, prometheus.GaugeValue, float64(*v.Val), labels...)
 				if err != nil {
 					log.Println(err)
 				}
-				if _, ok := col.metrics[key]; !ok {
-					col.metrics[key] = metric
-				} else {
-					col.metrics[key] = metric
-				}
-				//ch <- metric
-				//fmt.Println(metric.String(), v.Meta.Direction)
+				col.Lock()
+				col.Metrics[key] = ColMetric{metric, time.Now()}
+				col.Unlock()
 			}
 		}
 	}()
@@ -106,11 +120,17 @@ func GetCollector(ifname string) collector.Collector {
 }
 
 type Collector struct {
-	metrics map[string]prometheus.Metric
+	sync.RWMutex
+	Metrics map[string]ColMetric
+}
+
+type ColMetric struct {
+	prometheus.Metric
+	timeStamp time.Time
 }
 
 func (c *Collector) Update(ch chan<- prometheus.Metric) error {
-	for _, metric := range c.metrics {
+	for _, metric := range c.Metrics {
 		//fmt.Println("k, metric", k, metric)
 		ch <- metric
 	}
@@ -118,7 +138,7 @@ func (c *Collector) Update(ch chan<- prometheus.Metric) error {
 }
 
 type Metric struct {
-	Val  uint64
+	Val  *uint64
 	Meta LogPacket
 }
 type Traffics map[string]Metric
@@ -136,25 +156,28 @@ func calcTraffic(elements []interface{}) Traffics {
 				meta := e.(LogPacket)
 				meta.Direction = "receive"
 				if val, ok := traffics[key]; !ok {
+					v := uint64(v.Length)
 					traffics[key] = Metric{
-						Val:  uint64(v.Length),
+						Val:  &v,
 						Meta: meta,
 					}
 				} else {
-					val.Val += uint64(v.Length)
+					atomic.AddUint64(val.Val, uint64(v.Length))
 				}
+
 			} else {
 				//log.Println(i, "出站", v)
 				key := fmt.Sprintf("%s_%v_local@%s@%d%speer@%s@%d", v.IfName, v.Protocol, v.SrcIP.String(), v.SrcPort, "->", v.DstIP.String(), v.DstPort)
 				meta := e.(LogPacket)
 				meta.Direction = "send"
 				if val, ok := traffics[key]; !ok {
+					v := uint64(v.Length)
 					traffics[key] = Metric{
-						Val:  uint64(v.Length),
+						Val:  &v,
 						Meta: meta,
 					}
 				} else {
-					val.Val += uint64(v.Length)
+					atomic.AddUint64(val.Val, uint64(v.Length))
 				}
 			}
 		}
