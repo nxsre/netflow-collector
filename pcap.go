@@ -1,6 +1,7 @@
 package netflow_collector
 
 import (
+	"context"
 	"fmt"
 	"github.com/google/gopacket"
 	"github.com/google/gopacket/layers"
@@ -11,48 +12,104 @@ import (
 	"log"
 	"net"
 	"strconv"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
-// localAddrs = map[string]map[string]{"en0":map[string]string{"mac":"ip","ip":"mac"}}
-var localAddrs = map[string]map[string]string{}
-
-func GetCollector(ifname string) collector.Collector {
+var (
 	// 流式计算
-	flowIn := make(chan interface{})
-	flowOut := make(chan interface{})
+	flowIn  = make(chan interface{})
+	flowOut = make(chan interface{})
+	sink    *ext.ChanSink
+)
+
+func init() {
 	source := ext.NewChanSource(flowIn)
 	// flow.NewSlidingWindow 的两个入参 windowsize 和 slidingInterval 相等时，两个窗口数据无交集
 	slidingWindow, err := flow.NewSlidingWindow(1000*time.Millisecond, 1000*time.Millisecond)
 	if err != nil {
 		log.Fatal(err)
 	}
-	sink := ext.NewChanSink(flowOut)
-
+	sink = ext.NewChanSink(flowOut)
 	go func() {
 		// 连接数据源,
 		source.
 			Via(slidingWindow).
 			To(sink)
 	}()
+}
 
+// localAddrs = map[string]map[string]{"en0":map[string]string{"mac":"ip":{},"ip":"mac":{}}
+var localAddrs = map[string]map[string]map[string]struct{}{}
+
+// 增加本地接口地址（用来标记流量方向）
+func InsertLocalAddresses(ifname, ip, mac string) {
+	if _, ok := localAddrs[ifname]; !ok {
+		localAddrs[ifname] = map[string]map[string]struct{}{ip: {mac: {}}, mac: {ip: {}}}
+	} else {
+		if _, ok := localAddrs[ifname][ip]; !ok {
+			localAddrs[ifname][ip] = map[string]struct{}{mac: {}}
+		} else {
+			localAddrs[ifname][ip][mac] = struct{}{}
+		}
+		if _, ok := localAddrs[ifname][mac]; !ok {
+			localAddrs[ifname][mac] = map[string]struct{}{ip: {}}
+		} else {
+			localAddrs[ifname][mac][ip] = struct{}{}
+		}
+	}
+}
+
+// 删除本地接口地址（用来标记流量方向）
+func DeleteLocalAddresses(ifname, ip, mac string) {
+	if _, ok := localAddrs[ifname]; !ok {
+		return
+	}
+	if ip == "" && mac == "" {
+		delete(localAddrs, ifname)
+	}
+
+	if ip != "" {
+		delete(localAddrs[ifname], ip)
+		for k, v := range localAddrs[ifname] {
+			if _, ok := v[ip]; ok {
+				delete(localAddrs[ifname][k], ip)
+			}
+		}
+	}
+
+	if mac != "" {
+		delete(localAddrs[ifname], mac)
+		for k, v := range localAddrs[ifname] {
+			if _, ok := v[ip]; ok {
+				delete(localAddrs[ifname][k], mac)
+			}
+		}
+	}
+}
+
+// 获取本地接口列表
+func GetLocalAddresses() map[string]map[string]map[string]struct{} {
+	return localAddrs
+}
+
+func GetCollector(ctx context.Context, ifname, assetTag string) (collector.Collector, error) {
 	if ifname == "all" {
 		interfaces, err := net.Interfaces()
 		if err != nil {
-			return nil
+			return nil,err
 		}
 		for _, iface := range interfaces {
 			log.Println("cap", iface.Name)
-			//if i >= len(interfaces)-1 {
-			//	capture(iface.Name, flowIn)
-			//}
-			go capture(iface.Name, flowIn)
+			go capture(ctx, iface.Name, flowIn)
 		}
 	} else {
-		go capture(ifname, flowIn)
+		_, err := net.InterfaceByName(ifname)
+		if err != nil {
+			return nil, err
+		}
+		go capture(ctx, ifname, flowIn)
 	}
 	var col = &Collector{
 		Metrics: map[string]ColMetric{},
@@ -71,52 +128,60 @@ func GetCollector(ifname string) collector.Collector {
 					}
 				}
 				col.Unlock()
+			case <-ctx.Done():
+				return
 			}
 		}
 	}()
 
 	go func() {
 		// 实时读出窗口中的数据
-		for e := range sink.Out {
-			ts := calcTraffic(e.([]interface{}))
-			for key, v := range ts {
-				// TODO: 经过统计的流量监控数据写入到 kafka
-				desc := prometheus.NewDesc(v.Meta.Protocol.String(), "netflow-collector details metric",
-					[]string{"Protocol", "Version", "Direction", "LocalIP", "LocalPort", "PeerIP", "PeerPort"},
-					prometheus.Labels{"owner": "netflow-collector@odv"},
-				)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case e := <-sink.Out:
+				ts := calcTraffic(e.([]interface{}))
+				for key, v := range ts {
+					// TODO: 经过统计的流量监控数据写入到 kafka
+					desc := prometheus.NewDesc(v.Meta.Protocol.String(), "netflow-collector details metric",
+						[]string{"Protocol", "Version", "Direction", "LocalIP", "LocalPort", "PeerIP", "PeerPort"},
+						prometheus.Labels{"owner": "netflow-collector@odv", "assetTag": assetTag, "ifName": ifname},
+					)
 
-				labels := []string{}
-				switch v.Meta.Direction {
-				case InDirection:
-					labels = []string{v.Meta.Protocol.String(),
-						v.Meta.IPver,
-						string(v.Meta.Direction),
-						v.Meta.DstIP.String(),
-						strconv.FormatUint(uint64(v.Meta.DstPort), 10),
-						v.Meta.SrcIP.String(),
-						strconv.FormatUint(uint64(v.Meta.SrcPort), 10)}
-				case OutDirection:
-					labels = []string{v.Meta.Protocol.String(),
-						v.Meta.IPver,
-						string(v.Meta.Direction),
-						v.Meta.SrcIP.String(),
-						strconv.FormatUint(uint64(v.Meta.SrcPort), 10),
-						v.Meta.DstIP.String(),
-						strconv.FormatUint(uint64(v.Meta.DstPort), 10)}
+					labels := []string{}
+					switch v.Meta.Direction {
+					case InDirection:
+						labels = []string{v.Meta.Protocol.String(),
+							v.Meta.IPver,
+							string(v.Meta.Direction),
+							v.Meta.DstIP.String(),
+							strconv.FormatUint(uint64(v.Meta.DstPort), 10),
+							v.Meta.SrcIP.String(),
+							strconv.FormatUint(uint64(v.Meta.SrcPort), 10)}
+					case OutDirection:
+						labels = []string{v.Meta.Protocol.String(),
+							v.Meta.IPver,
+							string(v.Meta.Direction),
+							v.Meta.SrcIP.String(),
+							strconv.FormatUint(uint64(v.Meta.SrcPort), 10),
+							v.Meta.DstIP.String(),
+							strconv.FormatUint(uint64(v.Meta.DstPort), 10)}
+					}
+					metric, err := prometheus.NewConstMetric(desc, prometheus.GaugeValue, float64(*v.Val), labels...)
+					if err != nil {
+						log.Println(err)
+					}
+					col.Lock()
+					col.Metrics[key] = ColMetric{metric, time.Now()}
+					col.Unlock()
 				}
-				metric, err := prometheus.NewConstMetric(desc, prometheus.GaugeValue, float64(*v.Val), labels...)
-				if err != nil {
-					log.Println(err)
-				}
-				col.Lock()
-				col.Metrics[key] = ColMetric{metric, time.Now()}
-				col.Unlock()
 			}
 		}
+
 	}()
 
-	return col
+	return col,nil
 }
 
 type Collector struct {
@@ -186,7 +251,7 @@ func calcTraffic(elements []interface{}) Traffics {
 	return traffics
 }
 
-func capture(ifname string, flowIn chan interface{}) {
+func capture(ctx context.Context, ifname string, flowIn chan interface{}) {
 	// 判断是否 Loopback 网卡，parser.DecodeLayers 无法解析 loopback 设备的包，需要 packet.Layer 逐包断言
 	loopback := false
 	if iface, err := net.InterfaceByName(ifname); err == nil {
@@ -194,15 +259,20 @@ func capture(ifname string, flowIn chan interface{}) {
 			loopback = true
 		}
 		if _, ok := localAddrs[iface.Name]; !ok {
-			localAddrs[iface.Name] = map[string]string{}
+			localAddrs[iface.Name] = map[string]map[string]struct{}{}
 		}
 		addrs, _ := iface.Addrs()
-		address := []string{}
 		for _, addr := range addrs {
-			address = append(address, addr.String())
-			localAddrs[iface.Name][addr.String()] = iface.HardwareAddr.String()
+			if _, ok := localAddrs[iface.Name][addr.String()]; !ok {
+				localAddrs[iface.Name][addr.String()] = map[string]struct{}{}
+			}
+			if _, ok := localAddrs[iface.Name][iface.HardwareAddr.String()]; !ok {
+				localAddrs[iface.Name][iface.HardwareAddr.String()] = map[string]struct{}{}
+			}
+
+			localAddrs[iface.Name][addr.String()][iface.HardwareAddr.String()] = struct{}{}
+			localAddrs[iface.Name][iface.HardwareAddr.String()][addr.String()] = struct{}{}
 		}
-		localAddrs[iface.Name][iface.HardwareAddr.String()] = strings.Join(address, ",")
 	}
 
 	handle, err := NewLivePackageSoruce(ifname)
@@ -261,72 +331,79 @@ func capture(ifname string, flowIn chan interface{}) {
 
 	packetSource := gopacket.NewPacketSource(handle, handle.LinkType())
 	packetSource.NoCopy = true
-	for packet := range packetSource.Packets() {
-		var foundLayerTypes []gopacket.LayerType
-		parser := gopacket.NewDecodingLayerParser(
-			layers.LayerTypeEthernet,
-			&eth,
-			&ip4,
-			&ip6,
-			&tcp,
-			&udp,
-			&dns,
-			&icmp4,
-			&icmp6,
-		)
-		parser.IgnoreUnsupported = true
-		// parser.DecodeLayers 无法解析 loopback 网卡的包
-		err := parser.DecodeLayers(packet.Data(), &foundLayerTypes)
-		if err != nil {
-			//解析到无法识别到数据包(如果是ARP等不支持等报文则记录下就离开)
-			//log.Println("xxxxxxxxxxxxxxxx", err)
-			for _, a := range packet.Layers() {
-				log.Println(a.LayerType())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case packet := <-packetSource.Packets():
+			{
+				var foundLayerTypes []gopacket.LayerType
+				parser := gopacket.NewDecodingLayerParser(
+					layers.LayerTypeEthernet,
+					&eth,
+					&ip4,
+					&ip6,
+					&tcp,
+					&udp,
+					&dns,
+					&icmp4,
+					&icmp6,
+				)
+				parser.IgnoreUnsupported = true
+				// parser.DecodeLayers 无法解析 loopback 网卡的包
+				err := parser.DecodeLayers(packet.Data(), &foundLayerTypes)
+				if err != nil {
+					//解析到无法识别到数据包(如果是ARP等不支持等报文则记录下就离开)
+					//log.Println("xxxxxxxxxxxxxxxx", err)
+					for _, a := range packet.Layers() {
+						log.Println(a.LayerType())
+					}
+				}
+
+				var logPacket LogPacket
+				logPacket.IfName = ifname
+				logPacket.Time = time.Now()
+				logPacket.Length = packet.Metadata().Length
+				for _, layerType := range foundLayerTypes {
+					logPacket.Type = append(logPacket.Type, layerType)
+					switch layerType {
+					case layers.LayerTypeIPv4, layers.LayerTypeICMPv4:
+						logPacket.Protocol = ip4.Protocol
+						logPacket.IPver = ip4.LayerType().String()
+						logPacket.SrcIP = ip4.SrcIP
+						logPacket.DstIP = ip4.DstIP
+					case layers.LayerTypeIPv6, layers.LayerTypeICMPv6:
+						logPacket.Protocol = ip6.NextHeader
+						logPacket.IPver = ip6.LayerType().String()
+						logPacket.SrcIP = ip6.SrcIP
+						logPacket.DstIP = ip6.DstIP
+					case layers.LayerTypeEthernet:
+						logPacket.SrcMAC = eth.SrcMAC
+						logPacket.DstMAC = eth.DstMAC
+					case layers.LayerTypeARP: //处理ARP报文
+						//logPacket.Type = append(logPacket.Type, layerType)
+						//TODO 检测ARP泛洪
+						continue
+					case layers.LayerTypeTCP: // 处理TCP
+						logPacket.SrcPort = uint16(tcp.SrcPort)
+						logPacket.DstPort = uint16(tcp.DstPort)
+					case layers.LayerTypeUDP: // 处理UDP
+						logPacket.SrcPort = uint16(tcp.SrcPort)
+						logPacket.DstPort = uint16(tcp.DstPort)
+					}
+				}
+
+				//printEthInfo(packet)
+				// loopback 网卡需要单独解析包
+				if loopback {
+					parseNetworkInfo(packet, &logPacket)
+					parseTransportInfo(packet, &logPacket)
+				}
+
+				//log.Printf("%+v", logPacket)
+				flowIn <- logPacket
 			}
 		}
-
-		var logPacket LogPacket
-		logPacket.IfName = ifname
-		logPacket.Time = time.Now()
-		logPacket.Length = packet.Metadata().Length
-		for _, layerType := range foundLayerTypes {
-			logPacket.Type = append(logPacket.Type, layerType)
-			switch layerType {
-			case layers.LayerTypeIPv4, layers.LayerTypeICMPv4:
-				logPacket.Protocol = ip4.Protocol
-				logPacket.IPver = ip4.LayerType().String()
-				logPacket.SrcIP = ip4.SrcIP
-				logPacket.DstIP = ip4.DstIP
-			case layers.LayerTypeIPv6, layers.LayerTypeICMPv6:
-				logPacket.Protocol = ip6.NextHeader
-				logPacket.IPver = ip6.LayerType().String()
-				logPacket.SrcIP = ip6.SrcIP
-				logPacket.DstIP = ip6.DstIP
-			case layers.LayerTypeEthernet:
-				logPacket.SrcMAC = eth.SrcMAC
-				logPacket.DstMAC = eth.DstMAC
-			case layers.LayerTypeARP: //处理ARP报文
-				//logPacket.Type = append(logPacket.Type, layerType)
-				//TODO 检测ARP泛洪
-				continue
-			case layers.LayerTypeTCP: // 处理TCP
-				logPacket.SrcPort = uint16(tcp.SrcPort)
-				logPacket.DstPort = uint16(tcp.DstPort)
-			case layers.LayerTypeUDP: // 处理UDP
-				logPacket.SrcPort = uint16(tcp.SrcPort)
-				logPacket.DstPort = uint16(tcp.DstPort)
-			}
-		}
-
-		//printEthInfo(packet)
-		// loopback 网卡需要单独解析包
-		if loopback {
-			parseNetworkInfo(packet, &logPacket)
-			parseTransportInfo(packet, &logPacket)
-		}
-
-		//log.Printf("%+v", logPacket)
-		flowIn <- logPacket
 	}
 }
 
